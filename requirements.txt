@@ -6,4 +6,5 @@ openpyxl
 pyarrow
 s3fs
 boto3
+requests
 

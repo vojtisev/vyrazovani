@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import os
+import tempfile
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 
 from .config import DEFAULT_REQUIRED_COLUMNS
 
@@ -47,11 +51,73 @@ def load_and_validate_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Validat
     return df, validate_dataframe(df)
 
 
+def _download_url_to_cache_file(url: str, *, force: bool = False) -> Path:
+    """Stahne velky soubor z URL do cache na disk (streaming, bez nahrani do RAM)."""
+    # Na Streamlit Cloud muze byt repo read-only; preferujeme HOME cache nebo /tmp.
+    env_dir = os.environ.get("VYRAZ_DATA_CACHE_DIR")
+    candidates: List[Path] = []
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    candidates.append(Path.home() / ".cache" / "vyrazovani")
+    candidates.append(Path(tempfile.gettempdir()) / "vyrazovani_cache")
+
+    cache_dir: Optional[Path] = None
+    last_err: Optional[Exception] = None
+    for c in candidates:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            test = c / ".write_test"
+            test.write_bytes(b"ok")
+            test.unlink(missing_ok=True)
+            cache_dir = c
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if cache_dir is None:
+        raise PermissionError(f"Nepodarilo se najit zapisovatelny cache adresar. Posledni chyba: {last_err}")
+
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    target = cache_dir / f"source_{url_hash}.parquet"
+    if target.exists() and target.stat().st_size > 0 and not force:
+        return target
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    with requests.get(url, headers=headers, allow_redirects=True, stream=True, timeout=300) as resp:
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code} pri stahovani dat z URL.")
+
+        fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(cache_dir))
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            Path(tmp_name).replace(target)
+        finally:
+            try:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+            except Exception:
+                pass
+
+    return target
+
+
 def load_and_validate_data(
     parquet_path: Optional[str] = None,
     *,
     uploaded_bytes: Optional[bytes] = None,
     storage_options: Optional[Dict[str, Any]] = None,
+    force_download: bool = False,
 ) -> Tuple[pd.DataFrame, ValidationResult]:
     """Nacte Parquet data a vrati validaci sloupcu.
 
@@ -68,7 +134,8 @@ def load_and_validate_data(
         if not raw:
             raise ValueError("Prazdna cesta k Parquet.")
         if _is_http_url(raw):
-            df = pd.read_parquet(raw)
+            cached_file = _download_url_to_cache_file(raw, force=force_download)
+            df = pd.read_parquet(cached_file)
         elif _is_s3_uri(raw):
             df = pd.read_parquet(raw, storage_options=storage_options or {})
         else:
