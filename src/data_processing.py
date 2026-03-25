@@ -1,0 +1,297 @@
+"""Datova logika pro aplikaci analyzy vyrazovani."""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from .config import DEFAULT_REQUIRED_COLUMNS
+
+
+@dataclass
+class ValidationResult:
+    missing_columns: List[str]
+    present_columns: List[str]
+    warnings: List[str]
+
+
+def _is_http_url(s: str) -> bool:
+    t = s.strip().lower()
+    return t.startswith("http://") or t.startswith("https://")
+
+
+def _is_s3_uri(s: str) -> bool:
+    return s.strip().lower().startswith("s3://")
+
+
+def validate_dataframe(df: pd.DataFrame) -> ValidationResult:
+    """Validace pozadovanych sloupcu nad jiz nactenym DataFrame."""
+    missing = [col for col in DEFAULT_REQUIRED_COLUMNS if col not in df.columns]
+    present = [col for col in DEFAULT_REQUIRED_COLUMNS if col in df.columns]
+    warnings: List[str] = []
+    if missing:
+        warnings.append(
+            "Chybejici sloupce: " + ", ".join(missing) + ". Pouziji se fallbacky tam, kde to jde."
+        )
+    return ValidationResult(missing_columns=missing, present_columns=present, warnings=warnings)
+
+
+def load_and_validate_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, ValidationResult]:
+    """Vrati DataFrame a validaci (napr. po nacteni z jineho zdroje nez Parquet)."""
+    return df, validate_dataframe(df)
+
+
+def load_and_validate_data(
+    parquet_path: Optional[str] = None,
+    *,
+    uploaded_bytes: Optional[bytes] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, ValidationResult]:
+    """Nacte Parquet data a vrati validaci sloupcu.
+
+    Podporuje:
+    - nahraty soubor (uploaded_bytes),
+    - lokalni cestu,
+    - http(s) URL (vcetne predpodepsaneho odkazu),
+    - s3://... (volitelne storage_options pro pristupovy klic).
+    """
+    if uploaded_bytes is not None:
+        df = pd.read_parquet(io.BytesIO(uploaded_bytes))
+    elif parquet_path is not None:
+        raw = parquet_path.strip()
+        if not raw:
+            raise ValueError("Prazdna cesta k Parquet.")
+        if _is_http_url(raw):
+            df = pd.read_parquet(raw)
+        elif _is_s3_uri(raw):
+            df = pd.read_parquet(raw, storage_options=storage_options or {})
+        else:
+            path = Path(raw).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"Soubor neexistuje: {path}")
+            df = pd.read_parquet(path)
+    else:
+        raise ValueError("Zadej cestu k Parquet nebo nahraj soubor.")
+    return load_and_validate_dataframe(df)
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Vyčisti data, robustne preved datumy a vypln chybejici hodnoty."""
+    out = df.copy()
+    for col in ["TITUL_NAZEV", "TITUL_SIGN_FULL", "TITUL_JAZYK", "TITUL_DRUH_DOKUMENTU", "desk_subjects"]:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].fillna("").astype(str).str.strip()
+
+    if "TITUL_ROK_VYDANI" not in out.columns:
+        out["TITUL_ROK_VYDANI"] = np.nan
+    out["TITUL_ROK_VYDANI"] = pd.to_numeric(out["TITUL_ROK_VYDANI"], errors="coerce")
+
+    if "DATE" in out.columns:
+        out["DATE"] = pd.to_datetime(out["DATE"], errors="coerce", dayfirst=True)
+    else:
+        out["DATE"] = pd.NaT
+
+    if "YEAR" not in out.columns:
+        out["YEAR"] = out["DATE"].dt.year
+    out["YEAR"] = pd.to_numeric(out["YEAR"], errors="coerce")
+
+    if "ACTION_TYPE" not in out.columns:
+        out["ACTION_TYPE"] = ""
+    out["ACTION_TYPE"] = out["ACTION_TYPE"].fillna("").astype(str).str.lower().str.strip()
+    return out
+
+
+def get_reference_end_date(df: pd.DataFrame) -> pd.Timestamp:
+    """Reference datum: max(DATE) pokud existuje, jinak dnes."""
+    max_date = df["DATE"].max() if "DATE" in df.columns else pd.NaT
+    if pd.notna(max_date):
+        return pd.Timestamp(max_date)
+    return pd.Timestamp(datetime.today().date())
+
+
+def _build_title_key(df: pd.DataFrame) -> pd.Series:
+    sign = df.get("TITUL_SIGN_FULL", pd.Series("", index=df.index)).fillna("").astype(str)
+    name = df.get("TITUL_NAZEV", pd.Series("", index=df.index)).fillna("").astype(str)
+    return sign + "||" + name
+
+
+def extract_signature_prefix(signature_series: pd.Series, prefix_len: int = 2) -> pd.Series:
+    """Vrati prefix signatury (napr. 'JD' z 'JD 30652')."""
+    cleaned = signature_series.fillna("").astype(str).str.strip().str.upper()
+    # Vezmeme prvni blok pismen, fallback je prvni cast pred mezerou.
+    letters = cleaned.str.extract(r"^([A-Z]+)", expand=False).fillna("")
+    fallback = cleaned.str.split().str[0].fillna("")
+    base = letters.where(letters != "", fallback)
+    return base.str[:prefix_len]
+
+
+def filter_to_relevant_window(
+    df: pd.DataFrame,
+    years_window: int,
+    action_types_for_loans: List[str],
+) -> Tuple[pd.DataFrame, pd.Timestamp, pd.Timestamp]:
+    """Filtruje data na sledovane obdobi a vybrane akce."""
+    end_date = get_reference_end_date(df)
+    start_date = end_date - pd.DateOffset(years=years_window)
+
+    window_df = df.copy()
+    if "DATE" in window_df.columns and window_df["DATE"].notna().any():
+        window_df = window_df[(window_df["DATE"] >= start_date) & (window_df["DATE"] <= end_date)]
+    elif "YEAR" in window_df.columns and window_df["YEAR"].notna().any():
+        window_df = window_df[
+            (window_df["YEAR"] >= int(start_date.year)) & (window_df["YEAR"] <= int(end_date.year))
+        ]
+
+    if action_types_for_loans:
+        window_df = window_df[window_df["ACTION_TYPE"].isin([a.lower().strip() for a in action_types_for_loans])]
+    return window_df, pd.Timestamp(start_date), pd.Timestamp(end_date)
+
+
+def identify_exceptions(
+    titles_df: pd.DataFrame,
+    exception_keywords: Dict[str, List[str]],
+    exceptions_enabled: bool,
+) -> pd.Series:
+    """Detekuje vyjimky podle konfigurovatelnych klicovych slov."""
+    if not exceptions_enabled:
+        return pd.Series(False, index=titles_df.index)
+
+    flag = pd.Series(False, index=titles_df.index)
+    for col, keywords in exception_keywords.items():
+        if col not in titles_df.columns:
+            continue
+        txt = titles_df[col].fillna("").astype(str).str.lower()
+        col_flag = pd.Series(False, index=titles_df.index)
+        for kw in keywords:
+            kw = kw.strip().lower()
+            if kw:
+                col_flag = col_flag | txt.str.contains(kw, na=False)
+        flag = flag | col_flag
+    return flag
+
+
+def compute_title_metrics(
+    source_df: pd.DataFrame,
+    window_df: pd.DataFrame,
+    signature_col: str = "TITUL_SIGN_FULL",
+) -> pd.DataFrame:
+    """Spocita metriky na uroven titulu v ramci signatury."""
+    all_titles = source_df.copy()
+    all_titles["SIGN_PREFIX"] = extract_signature_prefix(all_titles[signature_col])
+    all_titles["title_key"] = _build_title_key(all_titles)
+    window_titles = window_df.copy()
+    window_titles["SIGN_PREFIX"] = extract_signature_prefix(window_titles[signature_col])
+    window_titles["title_key"] = _build_title_key(window_titles)
+
+    group_cols = ["title_key", signature_col, "SIGN_PREFIX", "TITUL_NAZEV"]
+    meta_cols = ["TITUL_DRUH_DOKUMENTU", "TITUL_JAZYK", "TITUL_ROK_VYDANI", "desk_subjects"]
+    existing_meta = [c for c in meta_cols if c in all_titles.columns]
+
+    base = all_titles[group_cols + existing_meta].drop_duplicates(subset=["title_key"]).set_index("title_key")
+    loans_5y = window_titles.groupby("title_key").size().rename("vypujcky_5_let")
+    last_date = window_titles.groupby("title_key")["DATE"].max().rename("datum_posledni_vypujcky")
+
+    result = base.join(loans_5y, how="left").join(last_date, how="left").reset_index()
+    result["vypujcky_5_let"] = result["vypujcky_5_let"].fillna(0).astype(int)
+
+    result["rank_v_signature"] = result.groupby("SIGN_PREFIX")["vypujcky_5_let"].rank(
+        method="min", ascending=False
+    )
+    result["pocet_v_signature"] = result.groupby("SIGN_PREFIX")["title_key"].transform("count")
+    result["percentil_v_signature"] = (
+        (result["pocet_v_signature"] - result["rank_v_signature"])
+        / result["pocet_v_signature"].replace(0, np.nan)
+        * 100
+    ).fillna(0)
+    result["relativni_pozice_v_signature"] = (
+        result["rank_v_signature"].astype(int).astype(str)
+        + "/"
+        + result["pocet_v_signature"].astype(int).astype(str)
+    )
+
+    reference_end = get_reference_end_date(source_df)
+    result["roky_od_posledni_vypujcky"] = (
+        (reference_end - result["datum_posledni_vypujcky"]).dt.days / 365.25
+    ).round(2)
+    result.loc[result["datum_posledni_vypujcky"].isna(), "roky_od_posledni_vypujcky"] = np.nan
+
+    result["rizikove_skore"] = (
+        (result["vypujcky_5_let"] == 0).astype(int) * 70
+        + (result["vypujcky_5_let"].between(1, 2)).astype(int) * 20
+        + (result["percentil_v_signature"] <= 30).astype(int) * 10
+        + (result["roky_od_posledni_vypujcky"].fillna(99) > 3).astype(int) * 15
+    )
+    return result
+
+
+def _exception_reason(row: pd.Series) -> str:
+    text = " ".join(
+        [
+            str(row.get("TITUL_DRUH_DOKUMENTU", "")),
+            str(row.get("desk_subjects", "")),
+            str(row.get("TITUL_SIGN_FULL", "")),
+        ]
+    ).lower()
+    for kw in ["beletrie", "poezie", "drama", "pragensia", "praha", "prazske"]:
+        if kw in text:
+            return f"chraneno vyjimkou: {kw}"
+    return "chraneno vyjimkou"
+
+
+def classify_titles(
+    titles_df: pd.DataFrame,
+    low_loan_min: int,
+    low_loan_max: int,
+    bottom_percentile_threshold: float,
+    stale_years_threshold: float,
+) -> pd.DataFrame:
+    """Klasifikace titulu do 4 kategorii + duvod_oznaceni."""
+    out = titles_df.copy()
+    out["klasifikace"] = "PONECHAT"
+    out["duvod_oznaceni"] = "recentni vypujcka nebo lepsi pozice v signature"
+
+    is_exception = out["vyjimka_flag"] == True  # noqa: E712
+    out.loc[is_exception, "klasifikace"] = "CHRANENO_VYJIMKOU"
+    out.loc[is_exception, "duvod_oznaceni"] = out.loc[is_exception].apply(_exception_reason, axis=1)
+
+    auto_mask = (~is_exception) & (out["vypujcky_5_let"] == 0)
+    out.loc[auto_mask, "klasifikace"] = "AUTO_KANDIDAT"
+    out.loc[auto_mask, "duvod_oznaceni"] = "0 vypujcek za poslednich 5 let"
+
+    manual_low = (
+        (~is_exception)
+        & out["vypujcky_5_let"].between(low_loan_min, low_loan_max)
+        & (out["percentil_v_signature"] <= bottom_percentile_threshold)
+    )
+    manual_stale = (~is_exception) & (out["roky_od_posledni_vypujcky"].fillna(999) > stale_years_threshold)
+    out.loc[manual_low | manual_stale, "klasifikace"] = "RUCNI_POSOUZENI"
+    out.loc[manual_low, "duvod_oznaceni"] = (
+        f"nizka vypujcnost ({low_loan_min}-{low_loan_max}) a spodni {bottom_percentile_threshold:.0f}% signatury"
+    )
+    out.loc[manual_stale, "duvod_oznaceni"] = f"posledni vypujcka starsi nez {stale_years_threshold:.1f} roku"
+    return out
+
+
+def aggregate_by_signature(classified_df: pd.DataFrame, signature_col: str = "SIGN_PREFIX") -> pd.DataFrame:
+    """Agregace po prefixu signatury s rozpadem na kategorie."""
+    summary = (
+        classified_df.groupby([signature_col, "klasifikace"])["title_key"]
+        .nunique()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    for col in ["AUTO_KANDIDAT", "RUCNI_POSOUZENI", "CHRANENO_VYJIMKOU", "PONECHAT"]:
+        if col not in summary.columns:
+            summary[col] = 0
+    summary["CELKEM_TITULU"] = (
+        summary["AUTO_KANDIDAT"] + summary["RUCNI_POSOUZENI"] + summary["CHRANENO_VYJIMKOU"] + summary["PONECHAT"]
+    )
+    return summary.sort_values("AUTO_KANDIDAT", ascending=False)
+
