@@ -25,6 +25,7 @@ from src.data_processing import (
     filter_to_relevant_window,
     identify_exceptions,
     load_and_validate_data,
+    is_precomputed_titles_metrics_parquet,
     resolve_parquet_source_to_local_file,
 )
 from src.export_utils import export_filtered_to_csv_bytes, export_filtered_to_excel_bytes
@@ -184,28 +185,47 @@ def main() -> None:
 
     if uploaded is None:
         p = Path(data_label)
-        prefix_summary = get_sign_prefix_summary_from_parquet(p)
-        prefix_options = ["(vsechny)"] + prefix_summary["SIGN_PREFIX"].astype(str).tolist() if not prefix_summary.empty else ["(vsechny)"]
-        with st.sidebar:
-            chosen_prefix = st.selectbox(
-                "Vyber SIGN_PREFIX (doporuceno pro rychlost)",
-                options=prefix_options,
-                index=1 if len(prefix_options) > 1 else 0,
-                help="Aby appka neběhala nad miliony titulů najednou, vyber prefix signatury.",
+        if is_precomputed_titles_metrics_parquet(p):
+            metrics_df = pd.read_parquet(p)
+            prefix_summary = (
+                metrics_df["SIGN_PREFIX"].fillna("").astype(str).value_counts().rename_axis("SIGN_PREFIX").reset_index(name="TITULU")
             )
-        st.subheader("Dostupne prefixy signatur (souhrn)")
-        st.dataframe(prefix_summary, use_container_width=True)
+            prefix_options = ["(vsechny)"] + prefix_summary["SIGN_PREFIX"].astype(str).tolist() if not prefix_summary.empty else ["(vsechny)"]
+            with st.sidebar:
+                chosen_prefix = st.selectbox(
+                    "Vyber SIGN_PREFIX (doporuceno pro rychlost)",
+                    options=prefix_options,
+                    index=1 if len(prefix_options) > 1 else 0,
+                    help="Aby appka neběhala nad miliony titulů najednou, vyber prefix signatury.",
+                )
+            st.subheader("Dostupne prefixy signatur (souhrn)")
+            st.dataframe(prefix_summary, use_container_width=True)
+            if chosen_prefix != "(vsechny)":
+                metrics_df = metrics_df[metrics_df["SIGN_PREFIX"].astype(str) == chosen_prefix]
+            st.caption("Pouzivam predpocitany dataset po titulech (titles_metrics.parquet).")
+        else:
+            prefix_summary = get_sign_prefix_summary_from_parquet(p)
+            prefix_options = ["(vsechny)"] + prefix_summary["SIGN_PREFIX"].astype(str).tolist() if not prefix_summary.empty else ["(vsechny)"]
+            with st.sidebar:
+                chosen_prefix = st.selectbox(
+                    "Vyber SIGN_PREFIX (doporuceno pro rychlost)",
+                    options=prefix_options,
+                    index=1 if len(prefix_options) > 1 else 0,
+                    help="Aby appka neběhala nad miliony titulů najednou, vyber prefix signatury.",
+                )
+            st.subheader("Dostupne prefixy signatur (souhrn)")
+            st.dataframe(prefix_summary, use_container_width=True)
 
-        metrics_df = compute_title_metrics_from_parquet(
-            p,
-            years_window=int(years_window),
-            action_types_for_loans=list(selected_actions),
-            sign_prefix=None if chosen_prefix == "(vsechny)" else chosen_prefix,
-        )
-        st.caption(
-            "Metriky pocitany cloud-friendly pres DuckDB (bez nacteni celeho Parquetu do pameti). "
-            "Pro stabilitu doporucujeme vybrat konkretni SIGN_PREFIX."
-        )
+            metrics_df = compute_title_metrics_from_parquet(
+                p,
+                years_window=int(years_window),
+                action_types_for_loans=list(selected_actions),
+                sign_prefix=None if chosen_prefix == "(vsechny)" else chosen_prefix,
+            )
+            st.caption(
+                "Metriky pocitany cloud-friendly pres DuckDB (bez nacteni celeho Parquetu do pameti). "
+                "Pro stabilitu doporucujeme vybrat konkretni SIGN_PREFIX."
+            )
     else:
         window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
         st.caption(

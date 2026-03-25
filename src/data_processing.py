@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import requests
 import duckdb
+import pyarrow.parquet as pq
 
 from .config import DEFAULT_REQUIRED_COLUMNS
 
@@ -138,6 +139,14 @@ def resolve_parquet_source_to_local_file(
     if not path.exists():
         raise FileNotFoundError(f"Soubor neexistuje: {path}")
     return path.resolve()
+
+
+def is_precomputed_titles_metrics_parquet(parquet_file: Path) -> bool:
+    """Pozna, zda je Parquet uz na urovni titulu (vystup builderu), ne raw vypujcky."""
+    schema = pq.read_schema(parquet_file)
+    names = set(schema.names)
+    required = {"title_key", "SIGN_PREFIX", "vypujcky_5_let"}
+    return required.issubset(names) and "ACTION_TYPE" not in names and "DATE" not in names
 
 
 def compute_title_metrics_from_parquet(
