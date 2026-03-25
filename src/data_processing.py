@@ -145,6 +145,7 @@ def compute_title_metrics_from_parquet(
     *,
     years_window: int,
     action_types_for_loans: List[str],
+    sign_prefix: Optional[str] = None,
     signature_col: str = "TITUL_SIGN_FULL",
     prefix_len: int = 2,
 ) -> pd.DataFrame:
@@ -158,6 +159,11 @@ def compute_title_metrics_from_parquet(
     # DuckDB: nacte jen potrebne sloupce a spocte agregace + ranky v signature.
     # Pozn.: desk_subjects muze byt list -> bereme jako VARCHAR.
     path_sql = str(parquet_file).replace("'", "''")
+    sign_prefix_filter = ""
+    if sign_prefix and str(sign_prefix).strip() and str(sign_prefix).strip() != "(vsechny)":
+        sp = str(sign_prefix).strip().upper().replace("'", "''")
+        sign_prefix_filter = f"WHERE SIGN_PREFIX = '{sp}'"
+
     query = f"""
 WITH src AS (
   SELECT
@@ -250,6 +256,7 @@ SELECT
   CAST(rank_v_signature AS BIGINT)::VARCHAR || '/' || CAST(pocet_v_signature AS BIGINT)::VARCHAR AS relativni_pozice_v_signature,
   ROUND(DATE_DIFF('day', datum_posledni_vypujcky, reference_end) / 365.25, 2) AS roky_od_posledni_vypujcky
 FROM ranked
+{sign_prefix_filter}
 """
     con = duckdb.connect(database=":memory:")
     try:
@@ -266,6 +273,42 @@ FROM ranked
         + (out["roky_od_posledni_vypujcky"].fillna(99) > 3).astype(int) * 15
     )
     return out
+
+
+def get_sign_prefix_summary_from_parquet(
+    parquet_file: Path,
+    *,
+    signature_col: str = "TITUL_SIGN_FULL",
+    prefix_len: int = 2,
+) -> pd.DataFrame:
+    """Vrati prehled prefixu signatur (pocet titulu) z Parquetu bez nacteni do pandas."""
+    path_sql = str(parquet_file).replace("'", "''")
+    query = f"""
+WITH src AS (
+  SELECT
+    CAST({signature_col} AS VARCHAR) AS signature,
+    CAST(TITUL_NAZEV AS VARCHAR) AS title_name
+  FROM read_parquet('{path_sql}')
+),
+base_titles AS (
+  SELECT
+    signature || '||' || title_name AS title_key,
+    UPPER(SUBSTR(COALESCE(NULLIF(REGEXP_EXTRACT(TRIM(signature), '^([A-Za-z]+)', 1), ''), SPLIT_PART(TRIM(signature), ' ', 1)), 1, {int(prefix_len)})) AS SIGN_PREFIX
+  FROM src
+  GROUP BY 1, 2
+)
+SELECT
+  SIGN_PREFIX,
+  COUNT(*) AS TITULU
+FROM base_titles
+GROUP BY 1
+ORDER BY TITULU DESC
+"""
+    con = duckdb.connect(database=":memory:")
+    try:
+        return con.execute(query).fetchdf()
+    finally:
+        con.close()
 
 
 def load_and_validate_data(
