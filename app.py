@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import plotly.express as px
+import pandas as pd
 import streamlit as st
 
 from src.config import DEFAULT_ACTION_TYPES, DEFAULT_EXCEPTION_KEYWORDS, DEFAULT_PARQUET_PATH
