@@ -24,6 +24,7 @@ from src.data_processing import (
     filter_to_relevant_window,
     identify_exceptions,
     load_and_validate_data,
+    resolve_parquet_source_to_local_file,
 )
 from src.export_utils import export_filtered_to_csv_bytes, export_filtered_to_excel_bytes
 
@@ -142,12 +143,14 @@ def main() -> None:
             df = clean_data(raw_df)
         else:
             resolved = resolve_parquet_path_for_load(parquet_path)
-            raw_df, validation = load_and_validate_data(
+            # Cloud-safe: pro URL si stahneme Parquet do cache souboru a dal pracujeme nad souborem,
+            # ne nad obrovskym pandas DF.
+            local_parquet = resolve_parquet_source_to_local_file(
                 resolved,
                 storage_options=_s3_storage_options_from_secrets(),
             )
-            data_label = resolved
-            df = clean_data(raw_df)
+            data_label = str(local_parquet)
+            df = None
     except Exception as exc:
         st.error(f"Nepodarilo se nacist Parquet data: {exc}")
         if uploaded is None and not _path_exists_for_ui(parquet_path):
@@ -157,45 +160,35 @@ def main() -> None:
             )
         return
 
-    if validation.warnings:
-        for warning in validation.warnings:
-            st.warning(warning)
-    st.success(f"Nacteno {len(df):,} radku z {data_label}")
+    if uploaded is not None:
+        if validation.warnings:
+            for warning in validation.warnings:
+                st.warning(warning)
+        st.success(f"Nacteno {len(df):,} radku z {data_label}")
+    else:
+        st.success(f"Zdroj pripraven: {data_label}")
 
-    action_options = sorted([x for x in df["ACTION_TYPE"].dropna().unique().tolist() if str(x).strip()]) if "ACTION_TYPE" in df.columns else []
-    default_actions = [a for a in DEFAULT_ACTION_TYPES if a in action_options] or (action_options if action_options else DEFAULT_ACTION_TYPES)
+    # V cloud-safe rezimu nemame cely DF; pouzijeme defaultni akcni typy.
+    action_options = (
+        sorted([x for x in df["ACTION_TYPE"].dropna().unique().tolist() if str(x).strip()])
+        if (uploaded is not None and df is not None and "ACTION_TYPE" in df.columns)
+        else DEFAULT_ACTION_TYPES
+    )
+    default_actions = [a for a in DEFAULT_ACTION_TYPES if a in action_options] or action_options
     selected_actions = st.sidebar.multiselect(
         "Ktere ACTION_TYPE se pocitaji jako vypujcky",
         options=action_options if action_options else DEFAULT_ACTION_TYPES,
         default=default_actions,
     )
 
-    # Na Streamlit Cloud velky Parquet casto shodi proces kvuli pameti.
-    # Pokud zdroj neni upload (typicky SharePoint URL -> lokalni cache soubor), pouzijeme DuckDB agregaci.
     if uploaded is None:
-        try:
-            p = Path(data_label)
-            if p.exists() and p.suffix.lower() == ".parquet":
-                metrics_df = compute_title_metrics_from_parquet(
-                    p,
-                    years_window=int(years_window),
-                    action_types_for_loans=list(selected_actions),
-                )
-                st.caption("Metriky pocitany cloud-friendly pres DuckDB (bez nacteni celeho Parquetu do pameti).")
-            else:
-                window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
-                st.caption(
-                    f"Obdobi analyzy: {start_date.date()} - {end_date.date()} "
-                    "(konec = nejnovejsi datum v datasetu, fallback = dnes)."
-                )
-                metrics_df = compute_title_metrics(df, window_df)
-        except Exception:
-            window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
-            st.caption(
-                f"Obdobi analyzy: {start_date.date()} - {end_date.date()} "
-                "(konec = nejnovejsi datum v datasetu, fallback = dnes)."
-            )
-            metrics_df = compute_title_metrics(df, window_df)
+        p = Path(data_label)
+        metrics_df = compute_title_metrics_from_parquet(
+            p,
+            years_window=int(years_window),
+            action_types_for_loans=list(selected_actions),
+        )
+        st.caption("Metriky pocitany cloud-friendly pres DuckDB (bez nacteni celeho Parquetu do pameti).")
     else:
         window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
         st.caption(

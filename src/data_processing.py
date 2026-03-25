@@ -113,6 +113,33 @@ def _download_url_to_cache_file(url: str, *, force: bool = False) -> Path:
     return target
 
 
+def resolve_parquet_source_to_local_file(
+    parquet_path: str,
+    *,
+    storage_options: Optional[Dict[str, Any]] = None,
+    force_download: bool = False,
+) -> Path:
+    """Vrati lokalni cestu k Parquetu.
+
+    - pro https://... stahne do cache souboru a vrati cestu
+    - pro s3://... zatim vyzaduje prime cteni (nepouziva se v cloud-safe toku)
+    - pro lokalni cestu jen overi existenci
+    """
+    raw = parquet_path.strip()
+    if not raw:
+        raise ValueError("Prazdna cesta k Parquet.")
+    if _is_http_url(raw):
+        return _download_url_to_cache_file(raw, force=force_download)
+    if _is_s3_uri(raw):
+        # S3 se cte primo pres pandas/pyarrow (fsspec); pro cloud-safe by bylo lepsi
+        # mit predem vygenerovany HTTPS link nebo mirne upravit logiku.
+        raise ValueError("Zdroj s3:// neni v tomto rezimu podporovan. Pouzij https:// nebo lokalni soubor.")
+    path = Path(raw).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Soubor neexistuje: {path}")
+    return path.resolve()
+
+
 def compute_title_metrics_from_parquet(
     parquet_file: Path,
     *,
