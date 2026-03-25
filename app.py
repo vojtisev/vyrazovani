@@ -20,6 +20,7 @@ from src.data_processing import (
     classify_titles,
     clean_data,
     compute_title_metrics,
+    compute_title_metrics_from_parquet,
     filter_to_relevant_window,
     identify_exceptions,
     load_and_validate_data,
@@ -138,6 +139,7 @@ def main() -> None:
         if uploaded is not None:
             raw_df, validation = load_and_validate_data(uploaded_bytes=uploaded.getvalue())
             data_label = "nahraty soubor"
+            df = clean_data(raw_df)
         else:
             resolved = resolve_parquet_path_for_load(parquet_path)
             raw_df, validation = load_and_validate_data(
@@ -145,7 +147,7 @@ def main() -> None:
                 storage_options=_s3_storage_options_from_secrets(),
             )
             data_label = resolved
-        df = clean_data(raw_df)
+            df = clean_data(raw_df)
     except Exception as exc:
         st.error(f"Nepodarilo se nacist Parquet data: {exc}")
         if uploaded is None and not _path_exists_for_ui(parquet_path):
@@ -160,21 +162,47 @@ def main() -> None:
             st.warning(warning)
     st.success(f"Nacteno {len(df):,} radku z {data_label}")
 
-    action_options = sorted([x for x in df["ACTION_TYPE"].dropna().unique().tolist() if str(x).strip()])
-    default_actions = [a for a in DEFAULT_ACTION_TYPES if a in action_options] or action_options
+    action_options = sorted([x for x in df["ACTION_TYPE"].dropna().unique().tolist() if str(x).strip()]) if "ACTION_TYPE" in df.columns else []
+    default_actions = [a for a in DEFAULT_ACTION_TYPES if a in action_options] or (action_options if action_options else DEFAULT_ACTION_TYPES)
     selected_actions = st.sidebar.multiselect(
         "Ktere ACTION_TYPE se pocitaji jako vypujcky",
         options=action_options if action_options else DEFAULT_ACTION_TYPES,
-        default=default_actions if action_options else DEFAULT_ACTION_TYPES,
+        default=default_actions,
     )
 
-    window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
-    st.caption(
-        f"Obdobi analyzy: {start_date.date()} - {end_date.date()} "
-        "(konec = nejnovejsi datum v datasetu, fallback = dnes)."
-    )
-
-    metrics_df = compute_title_metrics(df, window_df)
+    # Na Streamlit Cloud velky Parquet casto shodi proces kvuli pameti.
+    # Pokud zdroj neni upload (typicky SharePoint URL -> lokalni cache soubor), pouzijeme DuckDB agregaci.
+    if uploaded is None:
+        try:
+            p = Path(data_label)
+            if p.exists() and p.suffix.lower() == ".parquet":
+                metrics_df = compute_title_metrics_from_parquet(
+                    p,
+                    years_window=int(years_window),
+                    action_types_for_loans=list(selected_actions),
+                )
+                st.caption("Metriky pocitany cloud-friendly pres DuckDB (bez nacteni celeho Parquetu do pameti).")
+            else:
+                window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
+                st.caption(
+                    f"Obdobi analyzy: {start_date.date()} - {end_date.date()} "
+                    "(konec = nejnovejsi datum v datasetu, fallback = dnes)."
+                )
+                metrics_df = compute_title_metrics(df, window_df)
+        except Exception:
+            window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
+            st.caption(
+                f"Obdobi analyzy: {start_date.date()} - {end_date.date()} "
+                "(konec = nejnovejsi datum v datasetu, fallback = dnes)."
+            )
+            metrics_df = compute_title_metrics(df, window_df)
+    else:
+        window_df, start_date, end_date = filter_to_relevant_window(df, int(years_window), selected_actions)
+        st.caption(
+            f"Obdobi analyzy: {start_date.date()} - {end_date.date()} "
+            "(konec = nejnovejsi datum v datasetu, fallback = dnes)."
+        )
+        metrics_df = compute_title_metrics(df, window_df)
     metrics_df["vyjimka_flag"] = identify_exceptions(metrics_df, parsed_rules, exceptions_enabled)
     classified_df = classify_titles(metrics_df, low_min, low_max, bottom_percentile, stale_years)
 

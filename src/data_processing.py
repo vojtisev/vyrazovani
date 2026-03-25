@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
+import duckdb
 
 from .config import DEFAULT_REQUIRED_COLUMNS
 
@@ -110,6 +111,134 @@ def _download_url_to_cache_file(url: str, *, force: bool = False) -> Path:
                 pass
 
     return target
+
+
+def compute_title_metrics_from_parquet(
+    parquet_file: Path,
+    *,
+    years_window: int,
+    action_types_for_loans: List[str],
+    signature_col: str = "TITUL_SIGN_FULL",
+    prefix_len: int = 2,
+) -> pd.DataFrame:
+    """Cloud-friendly varianta: agregace po titulu pres DuckDB bez nacteni celeho DF do pandas."""
+    loan_actions = [a.lower().strip() for a in action_types_for_loans if str(a).strip()]
+    def _sql_quote(s: str) -> str:
+        return "'" + s.replace("'", "''") + "'"
+
+    action_list_sql = ", ".join([_sql_quote(a) for a in loan_actions]) or "''"
+
+    # DuckDB: nacte jen potrebne sloupce a spocte agregace + ranky v signature.
+    # Pozn.: desk_subjects muze byt list -> bereme jako VARCHAR.
+    path_sql = str(parquet_file).replace("'", "''")
+    query = f"""
+WITH src AS (
+  SELECT
+    CAST({signature_col} AS VARCHAR) AS signature,
+    CAST(TITUL_NAZEV AS VARCHAR) AS title_name,
+    CAST(TITUL_DRUH_DOKUMENTU AS VARCHAR) AS doc_type,
+    CAST(TITUL_JAZYK AS VARCHAR) AS lang,
+    TRY_CAST(TITUL_ROK_VYDANI AS DOUBLE) AS year_pub,
+    CAST(desk_subjects AS VARCHAR) AS desk_subjects,
+    TRY_CAST(DATE AS TIMESTAMP) AS dt,
+    TRY_CAST(YEAR AS INTEGER) AS yr,
+    LOWER(TRIM(CAST(ACTION_TYPE AS VARCHAR))) AS action_type
+  FROM read_parquet('{path_sql}')
+),
+ref AS (
+  SELECT COALESCE(MAX(dt), CURRENT_TIMESTAMP) AS end_dt FROM src
+),
+window_src AS (
+  SELECT s.*
+  FROM src s, ref r
+  WHERE
+    (
+      s.dt IS NOT NULL
+      AND s.dt >= (r.end_dt - INTERVAL '{int(years_window)} years')
+      AND s.dt <= r.end_dt
+    )
+    OR (
+      s.dt IS NULL
+      AND s.yr IS NOT NULL
+      AND s.yr >= EXTRACT(YEAR FROM (r.end_dt - INTERVAL '{int(years_window)} years'))::INTEGER
+      AND s.yr <= EXTRACT(YEAR FROM r.end_dt)::INTEGER
+    )
+),
+window_loans AS (
+  SELECT *
+  FROM window_src
+  WHERE action_type IN ({action_list_sql})
+),
+base_titles AS (
+  SELECT
+    signature || '||' || title_name AS title_key,
+    signature AS TITUL_SIGN_FULL,
+    UPPER(SUBSTR(COALESCE(NULLIF(REGEXP_EXTRACT(TRIM(signature), '^([A-Za-z]+)', 1), ''), SPLIT_PART(TRIM(signature), ' ', 1)), 1, {int(prefix_len)})) AS SIGN_PREFIX,
+    title_name AS TITUL_NAZEV,
+    ANY_VALUE(doc_type) AS TITUL_DRUH_DOKUMENTU,
+    ANY_VALUE(lang) AS TITUL_JAZYK,
+    ANY_VALUE(year_pub) AS TITUL_ROK_VYDANI,
+    ANY_VALUE(desk_subjects) AS desk_subjects
+  FROM src
+  GROUP BY 1, 2, 3, 4
+),
+metrics AS (
+  SELECT
+    b.*,
+    COALESCE(l.loan_cnt, 0) AS vypujcky_5_let,
+    l.last_dt AS datum_posledni_vypujcky,
+    r.end_dt AS reference_end
+  FROM base_titles b
+  LEFT JOIN (
+    SELECT
+      signature || '||' || title_name AS title_key,
+      COUNT(*) AS loan_cnt,
+      MAX(dt) AS last_dt
+    FROM window_loans
+    GROUP BY 1
+  ) l ON b.title_key = l.title_key
+  CROSS JOIN ref r
+),
+ranked AS (
+  SELECT
+    *,
+    RANK() OVER (PARTITION BY SIGN_PREFIX ORDER BY vypujcky_5_let DESC) AS rank_v_signature,
+    COUNT(*) OVER (PARTITION BY SIGN_PREFIX) AS pocet_v_signature
+  FROM metrics
+)
+SELECT
+  title_key,
+  TITUL_SIGN_FULL,
+  SIGN_PREFIX,
+  TITUL_NAZEV,
+  TITUL_DRUH_DOKUMENTU,
+  TITUL_JAZYK,
+  TITUL_ROK_VYDANI,
+  desk_subjects,
+  CAST(vypujcky_5_let AS BIGINT) AS vypujcky_5_let,
+  datum_posledni_vypujcky,
+  CAST(rank_v_signature AS BIGINT) AS rank_v_signature,
+  CAST(pocet_v_signature AS BIGINT) AS pocet_v_signature,
+  COALESCE(((pocet_v_signature - rank_v_signature) * 100.0) / NULLIF(pocet_v_signature, 0), 0) AS percentil_v_signature,
+  CAST(rank_v_signature AS BIGINT)::VARCHAR || '/' || CAST(pocet_v_signature AS BIGINT)::VARCHAR AS relativni_pozice_v_signature,
+  ROUND(DATE_DIFF('day', datum_posledni_vypujcky, reference_end) / 365.25, 2) AS roky_od_posledni_vypujcky
+FROM ranked
+"""
+    con = duckdb.connect(database=":memory:")
+    try:
+        out = con.execute(query).fetchdf()
+    finally:
+        con.close()
+
+    out["vypujcky_5_let"] = out["vypujcky_5_let"].fillna(0).astype(int)
+    # Rizikove skore zachovame stejne jako pandas varianta
+    out["rizikove_skore"] = (
+        (out["vypujcky_5_let"] == 0).astype(int) * 70
+        + (out["vypujcky_5_let"].between(1, 2)).astype(int) * 20
+        + (out["percentil_v_signature"] <= 30).astype(int) * 10
+        + (out["roky_od_posledni_vypujcky"].fillna(99) > 3).astype(int) * 15
+    )
+    return out
 
 
 def load_and_validate_data(
