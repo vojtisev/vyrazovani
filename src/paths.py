@@ -28,8 +28,9 @@ def find_default_parquet_in_project() -> Optional[Path]:
     Poradi:
     1. Presny nazev z configu (DEFAULT_PARQUET_PATH)
     2. Stejny nazev bez ohledu na velikost pismen (napr. .Parquet)
-    3. Jeden soubor, v jehoz nazvu je „vypujcky“ i „enriched“ (case-insensitive)
-    4. Pokud je v koreni projektu prave jeden *.parquet, pouzije se
+    3. `titles_metrics.parquet` (pokud existuje)
+    4. Jeden soubor, v jehoz nazvu je „vypujcky“ i „enriched“ (case-insensitive)
+    5. Pokud je v koreni projektu prave jeden *.parquet, pouzije se
     """
     root = project_root()
     expected = (root / DEFAULT_PARQUET_PATH).resolve()
@@ -40,6 +41,11 @@ def find_default_parquet_in_project() -> Optional[Path]:
     for path in root.iterdir():
         if path.is_file() and path.name.lower() == target_lower:
             return path.resolve()
+
+    # Prefer precomputed metrics if present.
+    tm = root / "titles_metrics.parquet"
+    if tm.is_file():
+        return tm.resolve()
 
     fuzzy: list[Path] = []
     for path in root.iterdir():
