@@ -222,11 +222,20 @@ def main() -> None:
     uploaded = None
     parquet_path = ""
 
+    # Streamlit si drží session_state i po změně Secrets; pokud uživatel kdysi zadal lokální cestu
+    # (např. /Users/...), na cloudu pak soubor neexistuje. V tom případě automaticky resetujeme na výchozí.
+    default_display = _initial_parquet_path_display()
     if "parquet_path_input" not in st.session_state:
-        st.session_state.parquet_path_input = _initial_parquet_path_display()
+        st.session_state.parquet_path_input = default_display
+    else:
+        cur = str(st.session_state.parquet_path_input or "").strip()
+        if cur and not _path_exists_for_ui(cur) and not _using_secrets_parquet_default():
+            st.session_state.parquet_path_input = default_display
 
     with st.sidebar:
         st.header("Nastavení analýzy")
+        if st.button("Resetovat cestu na výchozí dataset", help="Vrátí cestu na soubor vedle `app.py` (nebo na Secrets default)."):
+            st.session_state.parquet_path_input = default_display
         if not _using_secrets_parquet_default():
             found = find_default_parquet_in_project()
             if found is not None:
