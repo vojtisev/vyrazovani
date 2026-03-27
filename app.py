@@ -695,8 +695,14 @@ def main() -> None:
     c_manual = int(counts.get("RUCNI_POSOUZENI", 0))
     c_exc = int(counts.get("CHRANENO_VYJIMKOU", 0))
     c_keep = int(counts.get("PONECHAT", 0))
-    total_copies = int(pd.to_numeric(filtered.get("pocet_svazku", 0), errors="coerce").fillna(0).sum()) if not filtered.empty else 0
-    avg_perf = float(pd.to_numeric(filtered.get("vykon_na_svazek", 0.0), errors="coerce").fillna(0.0).mean()) if not filtered.empty else 0.0
+    if not filtered.empty and "pocet_svazku" in filtered.columns:
+        total_copies = int(pd.to_numeric(filtered["pocet_svazku"], errors="coerce").fillna(0).sum())
+    else:
+        total_copies = 0
+    if not filtered.empty and "vykon_na_svazek" in filtered.columns:
+        avg_perf = float(pd.to_numeric(filtered["vykon_na_svazek"], errors="coerce").fillna(0.0).mean())
+    else:
+        avg_perf = 0.0
 
     st.subheader("Souhrn")
     k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
