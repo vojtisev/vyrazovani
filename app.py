@@ -141,7 +141,17 @@ def _opid_display_label(col_name: str, opid_name_map: Dict[int, str]) -> str:
         raw = col_name.replace("pocet_opid_", "")
         try:
             oid = int(raw)
-            popis = opid_name_map.get(oid, "").strip()
+            fallback = {
+                4: "Abs. půjčování (načtení)",
+                5: "Abs. vrácení",
+                225: "Abs. půjčování (načtení)",
+                226: "Abs. vrácení",
+                94: "S. prez. půjčování (načtení)",
+                95: "Prez. vrácení",
+                97: "Prez. půjčování (načtení)",
+                98: "Prez. vrácení",
+            }
+            popis = opid_name_map.get(oid, "").strip() or fallback.get(oid, "")
             if popis:
                 return f"{popis} (OPID {oid})"
             return f"OPID {oid}"
@@ -446,6 +456,29 @@ def main() -> None:
         stale_years,
         auto_max_loans=int(auto_max_loans),
     )
+
+    with st.sidebar:
+        with st.expander("Diagnostika zdrojových souborů", expanded=False):
+            st.caption(f"Použitý dataset: `{data_label}`")
+            needed_cols = ["pocet_svazku", "vykon_na_svazek", "vypujcky_okno", "TITUL_NAZEV", "TITUL_SIGN_FULL"]
+            present = [c for c in needed_cols if c in metrics_df.columns]
+            missing = [c for c in needed_cols if c not in metrics_df.columns]
+            st.caption("Důležité sloupce: " + (", ".join(present) if present else "(žádné)"))
+            if missing:
+                st.warning("Chybí sloupce: " + ", ".join(missing))
+
+            # Sidecar soubory používané jen pro zobrazení popisů OPID.
+            candidates = []
+            try:
+                candidates.append(Path(data_label).parent / "opidy.parquet")
+            except Exception:
+                pass
+            candidates.append(project_root() / "opidy.parquet")
+            found = [p for p in candidates if p.exists()]
+            if found:
+                st.caption("Nalezeno `opidy.parquet`: " + ", ".join([f"`{p.name}`" for p in found]))
+            else:
+                st.info("Nenalezeno `opidy.parquet` vedle datasetu ani vedle `app.py` (OPID popisky mohou být jen jako ID).")
 
     opid_name_map: Dict[int, str] = {}
     if uploaded is None:

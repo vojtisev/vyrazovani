@@ -1,5 +1,6 @@
 *.parquet
 !titles_metrics.parquet
+!opidy.parquet
 .venv/
 __pycache__/
 *.pyc
