@@ -626,11 +626,17 @@ def main() -> None:
                     st.session_state["perf_range"] = (0.0, perf_cap)
                 st.session_state["_svazky_mode_prev"] = mode
 
+        # Streamlit policy: do not pass both `value=` and also set widget value via session_state.
+        # We keep the widget state as the single source of truth and only initialize defaults once.
+        if "copies_range" not in st.session_state:
+            st.session_state["copies_range"] = (0, max(1, int(max_copies_ui)))
+        if "perf_range" not in st.session_state:
+            st.session_state["perf_range"] = (0.0, float(perf_cap))
+
         c_min, c_max = st.slider(
             "Počet svazků na titul (rozsah)",
             min_value=0,
             max_value=max(1, int(max_copies_ui)),
-            value=st.session_state.get("copies_range", (0, max(1, int(max_copies_ui)))),
             key="copies_range",
             help="Filtr na počet exemplářů/svazků pro titul.",
         )
@@ -638,7 +644,6 @@ def main() -> None:
             "Výkon na svazek (výpůjčky / svazek)",
             min_value=0.0,
             max_value=float(perf_cap),
-            value=st.session_state.get("perf_range", (0.0, float(perf_cap))),
             key="perf_range",
             step=max(0.1, float(perf_cap) / 100.0),
             help="Počet výpůjček v období (pro výkon) dělený počtem svazků — vyšší = lepší využití exemplářů.",
