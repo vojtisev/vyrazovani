@@ -616,38 +616,42 @@ def main() -> None:
             prev = st.session_state.get("_svazky_mode_prev")
             if prev != mode:
                 if mode == "Kandidát na odpis (příliš svazků)":
-                    st.session_state["copies_range"] = (rec_copies_high, max_copies_ui)
-                    st.session_state["perf_range"] = (0.0, float(max(0.0, rec_perf_low)))
+                    st.session_state["filters_copies_range"] = (rec_copies_high, max_copies_ui)
+                    st.session_state["filters_perf_range"] = (0.0, float(max(0.0, rec_perf_low)))
                 elif mode == "Kandidát na dokup (málo svazků)":
-                    st.session_state["copies_range"] = (0, min(rec_copies_low, max_copies_ui))
-                    st.session_state["perf_range"] = (float(max(0.0, rec_perf_high)), perf_cap)
+                    st.session_state["filters_copies_range"] = (0, min(rec_copies_low, max_copies_ui))
+                    st.session_state["filters_perf_range"] = (float(max(0.0, rec_perf_high)), perf_cap)
                 else:
-                    st.session_state["copies_range"] = (0, max_copies_ui)
-                    st.session_state["perf_range"] = (0.0, perf_cap)
+                    st.session_state["filters_copies_range"] = (0, max_copies_ui)
+                    st.session_state["filters_perf_range"] = (0.0, perf_cap)
                 st.session_state["_svazky_mode_prev"] = mode
 
-        # Streamlit policy: do not pass both `value=` and also set widget value via session_state.
-        # We keep the widget state as the single source of truth and only initialize defaults once.
-        if "copies_range" not in st.session_state:
-            st.session_state["copies_range"] = (0, max(1, int(max_copies_ui)))
-        if "perf_range" not in st.session_state:
-            st.session_state["perf_range"] = (0.0, float(perf_cap))
+        # Keep filter values separate from widget keys to avoid Streamlit session_state/widget conflicts.
+        if "filters_copies_range" not in st.session_state:
+            st.session_state["filters_copies_range"] = (0, max(1, int(max_copies_ui)))
+        if "filters_perf_range" not in st.session_state:
+            st.session_state["filters_perf_range"] = (0.0, float(perf_cap))
 
         c_min, c_max = st.slider(
             "Počet svazků na titul (rozsah)",
             min_value=0,
             max_value=max(1, int(max_copies_ui)),
-            key="copies_range",
+            value=st.session_state["filters_copies_range"],
+            key="copies_range_widget",
             help="Filtr na počet exemplářů/svazků pro titul.",
         )
         p_min, p_max = st.slider(
             "Výkon na svazek (výpůjčky / svazek)",
             min_value=0.0,
             max_value=float(perf_cap),
-            key="perf_range",
+            value=st.session_state["filters_perf_range"],
+            key="perf_range_widget",
             step=max(0.1, float(perf_cap) / 100.0),
             help="Počet výpůjček v období (pro výkon) dělený počtem svazků — vyšší = lepší využití exemplářů.",
         )
+
+        st.session_state["filters_copies_range"] = (c_min, c_max)
+        st.session_state["filters_perf_range"] = (p_min, p_max)
 
         st.caption(
             "Tip: pro kandidáty na odpis nastav vyšší počet svazků na titul a nižší výkon na svazek; "
